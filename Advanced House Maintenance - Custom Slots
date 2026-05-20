@@ -1,0 +1,1027 @@
+/**
+ * Advanced House Maintenance - Custom Slots
+ *
+ * Modified concept/version for amitHalp
+ * - No predefined task database
+ * - 20 reserved configurable task slots
+ * - User-defined task names, categories, descriptions, intervals and costs
+ * - Supported scheduling modes:
+ *   1. After Completion
+ *   2. Fixed Interval From First Due Date
+ *   3. Annual Fixed Date
+ *   4. Monthly Fixed Day
+ * - Centralized due-date calculation
+ *
+ * Notes:
+ * - This is an app-only version.
+ * - If you use the optional child tile, keep the original child driver installed:
+ *   "Maintenance Dashboard Tile" by namespace "ShaneAllen".
+ */
+
+Integer getTaskSlotCount() { return 20 }
+
+String scheduleAfterCompletion() { return "after_completion" }
+String scheduleFixedInterval() { return "fixed_interval_from_first_due" }
+String scheduleAnnualFixedDate() { return "annual_fixed_date" }
+String scheduleMonthlyFixedDay() { return "monthly_fixed_day" }
+
+Long dayMs() { return 86400000L }
+
+definition(
+    name: "Advanced House Maintenance - Custom Slots",
+    namespace: "ShaneAllen",
+    author: "ShaneAllen",
+    description: "User-configurable household maintenance tracker with 20 custom task slots and multiple scheduling modes.",
+    category: "Convenience",
+    iconUrl: "",
+    iconX2Url: "",
+    iconX3Url: "",
+    oauth: true
+)
+
+preferences {
+    page(name: "mainPage")
+}
+
+mappings {
+    path("/dashboard") { action: [GET: "serveDashboard"] }
+    path("/dashboard/complete/:id") { action: [GET: "webCompleteTask"] }
+    path("/mute") { action: [GET: "webMuteTask"] }
+    path("/unmute") { action: [GET: "webUnmuteTask"] }
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "<b>Advanced House Maintenance - Custom Slots</b>", install: true, uninstall: true) {
+
+        section("<b>Web Dashboard Links</b>", hideable: true, hidden: true) {
+            paragraph "<div style='font-size:13px; color:#555;'>Share these links with household members. The dashboard shows active tasks and allows completing, muting, and reviewing status.</div>"
+
+            if (!state.accessToken) {
+                try {
+                    createAccessToken()
+                } catch (e) {
+                    paragraph "<span style='color:red; font-weight:bold;'>OAuth is not enabled.</span><br>Enable OAuth for this app code, save, then reopen the app settings."
+                }
+            }
+
+            if (state.accessToken) {
+                def localUri = "${getFullLocalApiServerUrl()}/dashboard?access_token=${state.accessToken}"
+                def cloudUri = "${getApiServerUrl()}/${hubUID}/apps/${app.id}/dashboard?access_token=${state.accessToken}"
+                paragraph "<b>Local Network Link:</b><br><a href='${localUri}' target='_blank' style='font-size:12px; word-break:break-all;'>${localUri}</a>"
+                paragraph "<b>Cloud Link:</b><br><a href='${cloudUri}' target='_blank' style='font-size:12px; word-break:break-all;'>${cloudUri}</a>"
+            }
+        }
+
+        section("<b>Live Maintenance Dashboard</b>", hideable: true, hidden: true) {
+            input "btnRefresh", "button", title: "Refresh Data"
+            paragraph getStatusHtml()
+
+            def tasks = getActiveTasksForDisplay()
+            if (tasks) {
+                def grouped = tasks.groupBy { it.category ?: "General" }
+                grouped.keySet().sort().each { catName ->
+                    paragraph "<h3 style='margin-top:15px;margin-bottom:5px;'>${htmlEncode(catName)}</h3>"
+                    def dashHTML = """
+                    <table style='width:100%; border-collapse:collapse; font-size:14px; margin-bottom:15px;'>
+                        <thead>
+                            <tr style='background-color:#343a40;color:white;'>
+                                <th style='padding:7px;border:1px solid #ccc;'>Task</th>
+                                <th style='padding:7px;border:1px solid #ccc;'>Schedule</th>
+                                <th style='padding:7px;border:1px solid #ccc;'>Last Completed</th>
+                                <th style='padding:7px;border:1px solid #ccc;'>Next Due</th>
+                                <th style='padding:7px;border:1px solid #ccc;'>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                    """
+
+                    grouped[catName].sort { it.days }.each { t ->
+                        dashHTML += "<tr>"
+                        dashHTML += "<td style='padding:7px;border:1px solid #ccc;font-weight:bold;'>${htmlEncode(t.name)}</td>"
+                        dashHTML += "<td style='padding:7px;border:1px solid #ccc;text-align:center;'>${htmlEncode(t.scheduleLabel)}</td>"
+                        dashHTML += "<td style='padding:7px;border:1px solid #ccc;text-align:center;'>${formatDateMs(t.lastCompleted)}</td>"
+                        dashHTML += "<td style='padding:7px;border:1px solid #ccc;text-align:center;'>${formatDateMs(t.dueDateMs)}</td>"
+                        dashHTML += "<td style='padding:7px;border:1px solid #ccc;text-align:center;'>${statusTextHtml(t)}</td>"
+                        dashHTML += "</tr>"
+                    }
+                    dashHTML += "</tbody></table>"
+                    paragraph dashHTML
+
+                    grouped[catName].sort { it.days }.each { t ->
+                        input "btnDashComplete_${t.id}", "button", title: "Complete: ${t.name}", width: 6
+                        if (!t.muted) input "btnSnooze_${t.id}", "button", title: "Snooze to Saturday: ${t.name}", width: 6
+                    }
+                    paragraph "<hr>"
+                }
+            } else {
+                paragraph "<i>No active task slots are configured. Enable and name at least one task below.</i>"
+            }
+        }
+
+        section("<b>90-Day Consumables Forecast</b>", hideable: true, hidden: true) {
+            def forecastTasks = []
+            BigDecimal totalCost = 0.0
+            getActiveTasksForDisplay().each { t ->
+                if (t.consumable && !t.muted && t.days <= 90) {
+                    def cost = safeDecimal(t.estCost, 0.0)
+                    totalCost += cost
+                    forecastTasks << t + [cost: cost]
+                }
+            }
+
+            if (forecastTasks) {
+                def html = "<table style='width:100%;border-collapse:collapse;font-size:14px;'>"
+                html += "<tr style='background-color:#17a2b8;color:white;'><th style='padding:6px;'>Task</th><th style='padding:6px;'>Due</th><th style='padding:6px;text-align:right;'>Estimated Cost</th></tr>"
+                forecastTasks.sort { it.days }.each { t ->
+                    html += "<tr><td style='padding:6px;border-bottom:1px solid #ccc;'>${htmlEncode(t.name)}</td><td style='padding:6px;border-bottom:1px solid #ccc;text-align:center;'>${dueLabel(t.days)}</td><td style='padding:6px;border-bottom:1px solid #ccc;text-align:right;'>${String.format('%.2f', t.cost)}</td></tr>"
+                }
+                html += "<tr><td colspan='2' style='padding:6px;text-align:right;font-weight:bold;'>Projected Spend:</td><td style='padding:6px;text-align:right;font-weight:bold;color:green;'>${String.format('%.2f', totalCost)}</td></tr>"
+                html += "</table>"
+                paragraph html
+            } else {
+                paragraph "<span style='color:green;font-weight:bold;'>No consumable purchases projected for the next 90 days.</span>"
+            }
+        }
+
+        section("<b>App Control & Global Settings</b>", hideable: true, hidden: true) {
+            input "appEnableSwitch", "capability.switch", title: "Master Enable/Disable Switch (Optional)", required: false, multiple: false
+            input "notifyDevices", "capability.notification", title: "Select Notification Devices", required: false, multiple: true
+            input "notifyModes", "mode", title: "Allowed Modes for Notifications", multiple: true, required: false
+            input "checkTime", "time", title: "Daily Evaluation Time", defaultValue: "09:00", required: true
+            input "upcomingDays", "number", title: "Days prior to trigger Upcoming notification", defaultValue: 7, required: true
+            input "remindOverdue", "bool", title: "Send Daily Reminders for Overdue tasks", defaultValue: true, required: true
+            input "txtEnable", "bool", title: "Enable Info / Action Logging", defaultValue: true, required: true
+            input "btnCreateDevice", "button", title: "Create / Verify Dashboard Tile Child Device"
+            input "resetHistory", "button", title: "Clear Action History"
+
+            if (getChildDevice("AHM_${app.id}")) {
+                paragraph "<span style='color:green;font-weight:bold;'>Dashboard tile child device exists.</span>"
+            }
+        }
+
+        section("<b>Managed Categories</b>", hideable: true, hidden: false) {
+            paragraph "<div style='font-size:13px;color:#555;'>Define up to 10 categories. Each task slot will then be assigned to one of these categories using a list of values.</div>"
+            (1..10).each { n ->
+                input "category_${n}", "text", title: "Category ${n}", defaultValue: defaultCategoryName(n), required: false, submitOnChange: true
+            }
+        }
+
+        section("<b>Task Slots</b>", hideable: false, hidden: false) {
+            paragraph "<div style='font-size:13px;color:#555;'>Configure up to 20 custom task slots. A task is active only when enabled and given a name.</div>"
+        }
+
+        (1..getTaskSlotCount()).each { n ->
+            def id = taskIdForSlot(n)
+            def titleName = settings["${id}_name"] ?: "Task Slot ${n}"
+            section("<b>${n}. ${htmlEncode(titleName)}</b>", hideable: true, hidden: n > 3) {
+                input "${id}_enabled", "bool", title: "Enable this task", defaultValue: false, submitOnChange: true
+
+                if (settings["${id}_enabled"]) {
+                    input "${id}_name", "text", title: "Task Name", required: false, submitOnChange: true
+                    input "${id}_category", "enum", title: "Category", options: getCategoryOptions(), defaultValue: "1", required: false
+                    input "${id}_description", "text", title: "Description / Procedure", required: false
+
+                    input "${id}_scheduleType", "enum",
+                        title: "Scheduling Type",
+                        options: scheduleTypeOptions(),
+                        defaultValue: scheduleAfterCompletion(),
+                        required: false,
+                        submitOnChange: true
+
+                    def scheduleType = settings["${id}_scheduleType"] ?: scheduleAfterCompletion()
+
+                    if (scheduleType == scheduleAfterCompletion()) {
+                        input "${id}_intervalDays", "number", title: "Interval after completion (days)", defaultValue: 30, required: false
+                        paragraph "<div style='font-size:12px;color:#555;'>Next due date is calculated from the last completed date.</div>"
+                    }
+                    else if (scheduleType == scheduleFixedInterval()) {
+                        input "${id}_firstDueDate", "date", title: "First due date", required: false
+                        input "${id}_intervalDays", "number", title: "Fixed interval (days)", defaultValue: 30, required: false
+                        paragraph "<div style='font-size:12px;color:#555;'>Future due dates are calculated from the first due date plus fixed intervals. Completing the task does not shift the series.</div>"
+                    }
+                    else if (scheduleType == scheduleAnnualFixedDate()) {
+                        input "${id}_month", "enum", title: "Due month", options: monthOptions(), defaultValue: "1", required: false
+                        input "${id}_dayOfMonth", "number", title: "Due day of month", defaultValue: 1, range: "1..31", required: false
+                        paragraph "<div style='font-size:12px;color:#555;'>Example: every year on September 1.</div>"
+                    }
+                    else if (scheduleType == scheduleMonthlyFixedDay()) {
+                        input "${id}_dayOfMonth", "number", title: "Due day of month", defaultValue: 1, range: "1..31", required: false
+                        paragraph "<div style='font-size:12px;color:#555;'>Example: every month on the 10th.</div>"
+                    }
+
+                    paragraph "<hr>"
+                    input "${id}_consumable", "bool", title: "Consumable / expected cost item", defaultValue: false, submitOnChange: true
+                    if (settings["${id}_consumable"]) {
+                        input "${id}_estCost", "decimal", title: "Estimated Cost", defaultValue: 0.0, required: false
+                    }
+
+                    paragraph getTaskPreviewHtml(id)
+                }
+            }
+        }
+
+        section("<b>Recent Action History</b>", hideable: true, hidden: true) {
+            if (state.actionHistory) {
+                paragraph "<span style='font-size:13px;font-family:monospace;'>${state.actionHistory.join('<br>')}</span>"
+            } else {
+                paragraph "<i>No history yet.</i>"
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Lifecycle
+// =============================================================================
+
+def installed() {
+    logInfo("Installed")
+    initialize()
+}
+
+def updated() {
+    logInfo("Updated")
+    unsubscribe()
+    unschedule()
+    initialize()
+}
+
+def initialize() {
+    ensureStateMaps()
+    initializeActiveTaskData()
+
+    if (appEnableSwitch) subscribe(appEnableSwitch, "switch", enableSwitchHandler)
+    subscribe(location, "systemStart", hubRestartHandler)
+
+    scheduleDailyCheck()
+    updateChildDevice()
+    logAction("App initialized.")
+}
+
+def ensureStateMaps() {
+    if (state.actionHistory == null) state.actionHistory = []
+    if (state.taskData == null) state.taskData = [:]
+    if (state.muteExpirations == null) state.muteExpirations = [:]
+}
+
+def initializeActiveTaskData() {
+    def tempData = state.taskData ?: [:]
+    boolean changed = false
+
+    getConfiguredTasks().each { task ->
+        if (!tempData[task.id]) {
+            tempData[task.id] = [lastCompleted: 0L, snoozedUntil: 0L, completedOccurrences: []]
+            changed = true
+            logAction("Tracking started for: ${task.name}")
+        } else {
+            if (tempData[task.id].snoozedUntil == null) tempData[task.id].snoozedUntil = 0L
+            if (tempData[task.id].completedOccurrences == null) tempData[task.id].completedOccurrences = []
+        }
+    }
+
+    if (changed) state.taskData = tempData
+}
+
+def scheduleDailyCheck() {
+    unschedule(dailyMaintenanceCheck)
+    if (checkTime) schedule(checkTime, dailyMaintenanceCheck)
+    else schedule("0 0 9 * * ?", dailyMaintenanceCheck)
+}
+
+def hubRestartHandler(evt) {
+    scheduleDailyCheck()
+}
+
+def enableSwitchHandler(evt) {
+    if (evt.value == "off") logAction("App disabled via master switch.")
+    else logAction("App enabled via master switch.")
+}
+
+// =============================================================================
+// Task Configuration
+// =============================================================================
+
+def getConfiguredTasks() {
+    def tasks = []
+
+    (1..getTaskSlotCount()).each { n ->
+        def id = taskIdForSlot(n)
+        def enabled = settings["${id}_enabled"] == true
+        def name = settings["${id}_name"]?.toString()?.trim()
+
+        if (enabled && name) {
+            tasks << [
+                id: id,
+                slot: n,
+                name: name,
+                category: resolveCategoryName(settings["${id}_category"]),
+                description: settings["${id}_description"]?.toString()?.trim() ?: "",
+                scheduleType: settings["${id}_scheduleType"] ?: scheduleAfterCompletion(),
+                intervalDays: safeInteger(settings["${id}_intervalDays"], 30),
+                firstDueDate: settings["${id}_firstDueDate"],
+                month: safeInteger(settings["${id}_month"], 1),
+                dayOfMonth: safeInteger(settings["${id}_dayOfMonth"], 1),
+                consumable: settings["${id}_consumable"] == true,
+                estCost: safeDecimal(settings["${id}_estCost"], 0.0)
+            ]
+        }
+    }
+
+    return tasks
+}
+
+def taskIdForSlot(Integer n) {
+    return String.format("task_%02d", n)
+}
+
+def scheduleTypeOptions() {
+    return [
+        (scheduleAfterCompletion()): "After completion - interval starts when task is completed",
+        (scheduleFixedInterval()): "Fixed interval from first due date",
+        (scheduleAnnualFixedDate()): "Annual fixed date - every year on selected month/day",
+        (scheduleMonthlyFixedDay()): "Monthly fixed day - every month on selected day"
+    ]
+}
+
+def monthOptions() {
+    return [
+        "1": "January",
+        "2": "February",
+        "3": "March",
+        "4": "April",
+        "5": "May",
+        "6": "June",
+        "7": "July",
+        "8": "August",
+        "9": "September",
+        "10": "October",
+        "11": "November",
+        "12": "December"
+    ]
+}
+
+def getCategoryOptions() {
+    def opts = [:]
+    (1..10).each { n ->
+        def name = settings["category_${n}"]?.toString()?.trim()
+        if (!name) name = defaultCategoryName(n)
+        opts[n.toString()] = name
+    }
+    return opts
+}
+
+def resolveCategoryName(def categoryValue) {
+    if (!categoryValue) return defaultCategoryName(1)
+    def key = categoryValue.toString()
+    def opts = getCategoryOptions()
+    return opts[key] ?: key
+}
+
+def defaultCategoryName(Integer n) {
+    def defaults = [
+        1: "General",
+        2: "Pool & Spa",
+        3: "Smart Home",
+        4: "Safety & Security",
+        5: "Garden & Outdoors",
+        6: "Power & Electrical",
+        7: "Water Systems",
+        8: "Vehicle Maintenance",
+        9: "Financial & Admin",
+        10: "Other"
+    ]
+    return defaults[n] ?: "Category ${n}"
+}
+
+// =============================================================================
+// Due-Date Logic
+// =============================================================================
+
+def getActiveTasksForDisplay() {
+    ensureStateMaps()
+    def nowMs = now()
+    def results = []
+
+    clearExpiredMutes(nowMs)
+
+    getConfiguredTasks().each { task ->
+        def taskData = state.taskData[task.id]
+        if (!taskData) {
+            taskData = [lastCompleted: 0L, snoozedUntil: 0L, completedOccurrences: []]
+            state.taskData[task.id] = taskData
+        }
+
+        def dueDateMs = calculateNextDueDateMs(task, taskData, nowMs)
+        def days = daysUntil(dueDateMs, nowMs)
+        def muted = isTaskMuted(task.id, nowMs)
+        def snoozed = taskData.snoozedUntil != null && taskData.snoozedUntil > nowMs
+
+        results << task + [
+            dueDateMs: dueDateMs,
+            days: days,
+            lastCompleted: taskData.lastCompleted ?: 0L,
+            muted: muted,
+            snoozed: snoozed,
+            muteUntil: muted ? state.muteExpirations[task.id] : null,
+            scheduleLabel: getScheduleLabel(task)
+        ]
+    }
+
+    return results
+}
+
+def calculateNextDueDateMs(Map task, Map taskData, Long nowMs) {
+    def scheduleType = task.scheduleType ?: scheduleAfterCompletion()
+
+    if (scheduleType == scheduleAfterCompletion()) {
+        def lastCompleted = taskData.lastCompleted ?: 0L
+        if (lastCompleted <= 0L) return startOfTodayMs(nowMs)
+        return startOfDayMs(lastCompleted + ((long)task.intervalDays * dayMs()))
+    }
+
+    if (scheduleType == scheduleFixedInterval()) {
+        def firstDueMs = parseDateSettingToStartOfDayMs(task.firstDueDate)
+        if (!firstDueMs) return startOfTodayMs(nowMs)
+        def intervalMs = Math.max(1, task.intervalDays as Integer) * dayMs()
+        def candidate = firstDueMs
+
+        if (candidate < startOfTodayMs(nowMs)) {
+            long periods = Math.floor((startOfTodayMs(nowMs) - candidate) / intervalMs).toLong()
+            candidate = candidate + (periods * intervalMs)
+            while (candidate < startOfTodayMs(nowMs) && isOccurrenceCompleted(taskData, candidate)) {
+                candidate += intervalMs
+            }
+            if (candidate < startOfTodayMs(nowMs)) candidate += intervalMs
+        }
+
+        while (isOccurrenceCompleted(taskData, candidate)) {
+            candidate += intervalMs
+        }
+        return startOfDayMs(candidate)
+    }
+
+    if (scheduleType == scheduleAnnualFixedDate()) {
+        Calendar cal = Calendar.getInstance(location.timeZone)
+        cal.setTimeInMillis(nowMs)
+        int year = cal.get(Calendar.YEAR)
+        int month = clamp(task.month as Integer, 1, 12)
+        int day = clamp(task.dayOfMonth as Integer, 1, 31)
+
+        long candidate = dateToMs(year, month, day)
+        if (candidate < startOfTodayMs(nowMs) || isOccurrenceCompleted(taskData, candidate)) {
+            candidate = dateToMs(year + 1, month, day)
+        }
+        while (isOccurrenceCompleted(taskData, candidate)) {
+            year++
+            candidate = dateToMs(year + 1, month, day)
+        }
+        return candidate
+    }
+
+    if (scheduleType == scheduleMonthlyFixedDay()) {
+        Calendar cal = Calendar.getInstance(location.timeZone)
+        cal.setTimeInMillis(nowMs)
+        int year = cal.get(Calendar.YEAR)
+        int month = cal.get(Calendar.MONTH) + 1
+        int day = clamp(task.dayOfMonth as Integer, 1, 31)
+
+        long candidate = dateToMs(year, month, day)
+        if (candidate < startOfTodayMs(nowMs) || isOccurrenceCompleted(taskData, candidate)) {
+            cal.set(Calendar.DAY_OF_MONTH, 1)
+            cal.add(Calendar.MONTH, 1)
+            year = cal.get(Calendar.YEAR)
+            month = cal.get(Calendar.MONTH) + 1
+            candidate = dateToMs(year, month, day)
+        }
+        while (isOccurrenceCompleted(taskData, candidate)) {
+            cal.setTimeInMillis(candidate)
+            cal.set(Calendar.DAY_OF_MONTH, 1)
+            cal.add(Calendar.MONTH, 1)
+            year = cal.get(Calendar.YEAR)
+            month = cal.get(Calendar.MONTH) + 1
+            candidate = dateToMs(year, month, day)
+        }
+        return candidate
+    }
+
+    return startOfTodayMs(nowMs)
+}
+
+def isOccurrenceCompleted(Map taskData, Long dueDateMs) {
+    def completed = taskData.completedOccurrences ?: []
+    return completed.contains(startOfDayMs(dueDateMs).toString())
+}
+
+def markOccurrenceCompleted(Map taskData, Long dueDateMs) {
+    def completed = taskData.completedOccurrences ?: []
+    def key = startOfDayMs(dueDateMs).toString()
+    if (!completed.contains(key)) completed << key
+    if (completed.size() > 50) completed = completed[-50..-1]
+    taskData.completedOccurrences = completed
+}
+
+def getScheduleLabel(Map task) {
+    def scheduleType = task.scheduleType ?: scheduleAfterCompletion()
+    if (scheduleType == scheduleAfterCompletion()) return "Every ${task.intervalDays} days after completion"
+    if (scheduleType == scheduleFixedInterval()) return "Every ${task.intervalDays} days from ${task.firstDueDate ?: 'first due date'}"
+    if (scheduleType == scheduleAnnualFixedDate()) return "Every year on ${monthName(task.month)} ${task.dayOfMonth}"
+    if (scheduleType == scheduleMonthlyFixedDay()) return "Every month on day ${task.dayOfMonth}"
+    return "Unknown"
+}
+
+// =============================================================================
+// Actions
+// =============================================================================
+
+def appButtonHandler(btn) {
+    ensureStateMaps()
+
+    if (btn == "btnRefresh") {
+        updateChildDevice()
+    }
+    else if (btn == "btnCreateDevice") {
+        createIntegrationDevice()
+    }
+    else if (btn == "resetHistory") {
+        state.actionHistory = []
+    }
+    else if (btn.startsWith("btnDashComplete_")) {
+        completeTask(btn.replace("btnDashComplete_", ""))
+    }
+    else if (btn.startsWith("btnSnooze_")) {
+        snoozeTask(btn.replace("btnSnooze_", ""))
+    }
+}
+
+def completeTask(String taskId) {
+    ensureStateMaps()
+    def task = getConfiguredTasks().find { it.id == taskId }
+    if (!task) return
+
+    def tempData = state.taskData ?: [:]
+    def taskData = tempData[taskId] ?: [lastCompleted: 0L, snoozedUntil: 0L, completedOccurrences: []]
+    def nowMs = now()
+    def dueDateMs = calculateNextDueDateMs(task, taskData, nowMs)
+
+    taskData.lastCompleted = nowMs
+    taskData.snoozedUntil = 0L
+
+    if ((task.scheduleType ?: scheduleAfterCompletion()) != scheduleAfterCompletion()) {
+        markOccurrenceCompleted(taskData, dueDateMs)
+    }
+
+    tempData[taskId] = taskData
+    state.taskData = tempData
+
+    def nextDue = calculateNextDueDateMs(task, taskData, nowMs)
+    logAction("Completed: '${task.name}'. Next due: ${formatDateMs(nextDue)}.")
+    updateChildDevice()
+}
+
+def snoozeTask(String taskId) {
+    ensureStateMaps()
+    def task = getConfiguredTasks().find { it.id == taskId }
+    if (!task) return
+
+    Calendar cal = Calendar.getInstance(location.timeZone)
+    int today = cal.get(Calendar.DAY_OF_WEEK)
+    int addDays = Calendar.SATURDAY - today
+    if (addDays <= 0) addDays += 7
+
+    def tempData = state.taskData ?: [:]
+    def taskData = tempData[taskId] ?: [lastCompleted: 0L, snoozedUntil: 0L, completedOccurrences: []]
+    taskData.snoozedUntil = now() + ((long)addDays * dayMs())
+    tempData[taskId] = taskData
+    state.taskData = tempData
+
+    logAction("Task '${task.name}' snoozed until Saturday.")
+    updateChildDevice()
+}
+
+def createIntegrationDevice() {
+    def childId = "AHM_${app.id}"
+    if (!getChildDevice(childId)) {
+        try {
+            addChildDevice("ShaneAllen", "Maintenance Dashboard Tile", childId, null, [name: "Advanced House Maintenance Device"])
+            logAction("Created dashboard tile child device.")
+            runIn(2, "updateChildDevice")
+        } catch (e) {
+            log.error "Failed to create child device. Ensure 'Maintenance Dashboard Tile' driver is installed. Error: ${e}"
+        }
+    } else {
+        logInfo("Dashboard tile child device already exists.")
+    }
+}
+
+// =============================================================================
+// Web Dashboard
+// =============================================================================
+
+def serveDashboard() {
+    ensureStateMaps()
+    def tasks = getActiveTasksForDisplay()
+    def threshold = safeInteger(upcomingDays, 7)
+
+    def overdueTasks = tasks.findAll { !it.muted && !it.snoozed && it.days < 0 }
+    def dueTodayTasks = tasks.findAll { !it.muted && !it.snoozed && it.days == 0 }
+    def upcomingTasks = tasks.findAll { !it.muted && !it.snoozed && it.days > 0 && it.days <= threshold }
+    def goodTasks = tasks.findAll { !it.muted && !it.snoozed && it.days > threshold }
+    def snoozedTasks = tasks.findAll { it.snoozed }
+    def mutedTasks = tasks.findAll { it.muted }
+
+    StringBuilder html = new StringBuilder()
+    html.append("<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Maintenance Dashboard</title><meta name='viewport' content='width=device-width, initial-scale=1'>")
+    html.append("""
+    <style>
+        body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:20px;background:#0d0d0d;color:#e0e0e0;margin:0;}
+        .container{max-width:900px;margin:0 auto;background:#151515;padding:25px;border-radius:12px;box-sizing:border-box;width:100%;}
+        .summary-box{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:25px;}
+        .summary-card{flex:1;min-width:100px;box-sizing:border-box;background:#1e1e1e;padding:15px;border-radius:8px;text-align:center;border-bottom:3px solid #333;}
+        .summary-card b{display:block;font-size:24px;color:#fff;margin-bottom:5px;}
+        .summary-card span{font-size:12px;color:#aaa;text-transform:uppercase;}
+        details{margin-bottom:15px;background:#1c1c1c;border-radius:6px;}
+        summary{padding:12px 15px;border-radius:6px;border-left:4px solid #3498db;cursor:pointer;color:#fff;font-weight:bold;font-size:16px;user-select:none;}
+        .folder-content{padding:15px;background:#181818;border-bottom-left-radius:6px;border-bottom-right-radius:6px;}
+        .task-card{background:#222;padding:15px;border-radius:8px;margin-bottom:12px;border-left:4px solid #333;display:flex;align-items:center;gap:12px;}
+        .red{border-left-color:#e74c3c;}.orange{border-left-color:#f39c12;}.yellow{border-left-color:#f1c40f;}.green{border-left-color:#27ae60;}.purple{border-left-color:#9b59b6;}
+        .task-info{flex-grow:1;min-width:0;}.task-name{font-size:15px;font-weight:bold;color:#fff;margin-bottom:3px;}.task-details{font-size:13px;color:#aaa;line-height:1.4;}.task-sub{font-size:11px;color:#7f8c8d;margin-top:5px;}
+        .controls{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-shrink:0;}
+        .btn{background:#27ae60;color:#fff;border:1px solid #219653;padding:8px 14px;font-size:12px;border-radius:4px;font-weight:bold;cursor:pointer;white-space:nowrap;text-decoration:none;}
+        .mute-form{display:inline-flex;align-items:center;margin:0;}.mute-input{width:55px;padding:0 6px;font-size:11px;border-radius:4px 0 0 4px;border:1px solid #8e44ad;background:#111;color:#fff;height:30px;box-sizing:border-box;}.mute-btn{border-radius:0 4px 4px 0;background:#8e44ad;border-color:#8e44ad;height:30px;color:#fff;border-style:solid;border-width:1px;font-size:12px;font-weight:bold;cursor:pointer;padding:0 8px;}
+        .completed-state{opacity:0;transform:scale(0.95);pointer-events:none;transition:all .3s ease;}
+        @media(max-width:700px){.task-card{flex-wrap:wrap}.controls{width:100%;justify-content:flex-start;}}
+    </style>
+    <script>
+        function markComplete(taskId, btnElement) {
+            let card = document.getElementById('card-' + taskId);
+            let originalText = btnElement.innerHTML;
+            btnElement.innerHTML = 'Saving...';
+            btnElement.disabled = true;
+            fetch('dashboard/complete/' + taskId + '?access_token=${state.accessToken}')
+            .then(r => {
+                if(r.ok) {
+                    card.classList.add('completed-state');
+                    setTimeout(() => { window.location.href='dashboard?access_token=${state.accessToken}'; }, 400);
+                } else {
+                    btnElement.innerHTML = 'Error';
+                    setTimeout(() => { btnElement.innerHTML = originalText; btnElement.disabled = false; }, 2000);
+                }
+            }).catch(e => {
+                btnElement.innerHTML = 'Error';
+                setTimeout(() => { btnElement.innerHTML = originalText; btnElement.disabled = false; }, 2000);
+            });
+        }
+    </script>
+    """)
+    html.append("</head><body><div class='container'>")
+    html.append("<h2 style='text-align:center;color:#fff;margin:0 0 5px 0;'>Maintenance Dashboard</h2>")
+    html.append("<p style='text-align:center;font-size:13px;color:#888;margin-bottom:25px;'>Last Sync: ${new Date().format('MM/dd/yyyy h:mm a', location.timeZone)}</p>")
+    html.append("<div class='summary-box'>")
+    html.append("<div class='summary-card' style='border-bottom-color:#e74c3c;'><b>${overdueTasks.size()}</b><span>Overdue</span></div>")
+    html.append("<div class='summary-card' style='border-bottom-color:#f39c12;'><b>${dueTodayTasks.size()}</b><span>Due Today</span></div>")
+    html.append("<div class='summary-card' style='border-bottom-color:#f1c40f;'><b>${upcomingTasks.size()}</b><span>Upcoming</span></div>")
+    html.append("<div class='summary-card' style='border-bottom-color:#3498db;'><b>${tasks.size()}</b><span>Tracked</span></div>")
+    html.append("</div>")
+
+    appendTaskSection(html, "Overdue Tasks", overdueTasks, "red", true)
+    appendTaskSection(html, "Due Today", dueTodayTasks, "orange", true)
+    appendTaskSection(html, "Upcoming Tasks", upcomingTasks, "yellow", true)
+    appendCategorySections(html, goodTasks)
+    appendTaskSection(html, "Snoozed Tasks", snoozedTasks, "purple", false)
+    appendTaskSection(html, "Muted Tasks", mutedTasks, "purple", false)
+
+    if (!tasks) html.append("<div style='text-align:center;padding:20px;background:#1e1e1e;border-radius:8px;color:#27ae60;font-weight:bold;'>No active task slots are configured.</div>")
+    html.append("</div></body></html>")
+
+    return render(contentType: "text/html", data: html.toString(), status: 200)
+}
+
+def appendTaskSection(StringBuilder html, String title, List taskList, String colorClass, Boolean openByDefault) {
+    if (!taskList) return
+    html.append("<details ${openByDefault ? 'open' : ''}><summary>${htmlEncode(title)} <span style='float:right;font-size:12px;color:#888;'>${taskList.size()} Tasks</span></summary><div class='folder-content'>")
+    taskList.sort { it.days }.each { t ->
+        html.append(buildTaskCard(t, colorClass))
+    }
+    html.append("</div></details>")
+}
+
+def appendCategorySections(StringBuilder html, List taskList) {
+    if (!taskList) return
+
+    def grouped = taskList.groupBy { it.category ?: "General" }
+    grouped.keySet().sort().each { catName ->
+        def catTasks = grouped[catName]
+        html.append("<details class='category-folder'><summary style='border-left-color:#3498db;'>📁 ${htmlEncode(catName)} <span style='float:right;font-size:12px;color:#888;'>${catTasks.size()} Tasks</span></summary><div class='folder-content'>")
+        catTasks.sort { it.days }.each { t ->
+            html.append(buildTaskCard(t, "green"))
+        }
+        html.append("</div></details>")
+    }
+}
+
+def buildTaskCard(Map t, String colorClass) {
+    def desc = t.description ? htmlEncode(t.description) : "No description"
+    def sub = "${htmlEncode(t.scheduleLabel)} • Last: ${formatDateMs(t.lastCompleted)} • Next: ${formatDateMs(t.dueDateMs)}"
+    def controls = "<div class='controls'>"
+    if (t.muted) {
+        controls += "<span style='color:#9b59b6;font-size:12px;'>Muted until ${formatDateMs(t.muteUntil)}</span>"
+        controls += "<a href='unmute?taskId=${t.id}&access_token=${state.accessToken}' class='btn' style='background:#8e44ad;border-color:#8e44ad;'>Unmute</a>"
+    } else {
+        controls += "<button class='btn' onclick=\"markComplete('${t.id}', this)\">Complete</button>"
+        controls += "<form action='mute' method='GET' class='mute-form'><input type='hidden' name='taskId' value='${t.id}'><input type='hidden' name='access_token' value='${state.accessToken}'><input type='number' name='days' class='mute-input' placeholder='days' required min='1'><button type='submit' class='mute-btn'>Mute</button></form>"
+    }
+    controls += "</div>"
+
+    return "<div class='task-card ${colorClass}' id='card-${t.id}'><div class='task-info'><div class='task-name'>${htmlEncode(t.name)}</div><div class='task-details'>${desc}</div><div class='task-sub'>${htmlEncode(dueLabel(t.days))} • ${sub}</div></div>${controls}</div>"
+}
+
+def webCompleteTask() {
+    def taskId = params.id
+    if (taskId) {
+        completeTask(taskId)
+        render contentType: "application/json", data: '{"status":"success"}', status: 200
+    } else {
+        render contentType: "application/json", data: '{"status":"error", "message":"No ID provided"}', status: 400
+    }
+}
+
+def webMuteTask() {
+    try {
+        def tId = params.taskId
+        def days = params.days
+        if (tId && days && days.toString().isInteger()) {
+            long muteUntil = now() + ((long)days.toInteger() * dayMs())
+            if (state.muteExpirations == null) state.muteExpirations = [:]
+            state.muteExpirations[tId] = muteUntil
+            def task = getConfiguredTasks().find { it.id == tId }
+            logAction("Task '${task?.name ?: tId}' muted for ${days} days via portal.")
+            updateChildDevice()
+        }
+        return render(contentType: "text/html", data: getRedirectHtml("Muting task..."), status: 200)
+    } catch (e) {
+        log.error "Mute error: ${e}"
+        return render(contentType: "text/html", data: "Error executing mute: ${e.message}", status: 500)
+    }
+}
+
+def webUnmuteTask() {
+    try {
+        def tId = params.taskId
+        if (tId && state.muteExpirations) {
+            state.muteExpirations.remove(tId)
+            def task = getConfiguredTasks().find { it.id == tId }
+            logAction("Task '${task?.name ?: tId}' unmuted via portal.")
+            updateChildDevice()
+        }
+        return render(contentType: "text/html", data: getRedirectHtml("Unmuting task..."), status: 200)
+    } catch (e) {
+        log.error "Unmute error: ${e}"
+        return render(contentType: "text/html", data: "Error executing unmute: ${e.message}", status: 500)
+    }
+}
+
+def getRedirectHtml(String msgText) {
+    return "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'><script>setTimeout(function(){window.location.href='dashboard?access_token=${state.accessToken}';}, 0);</script></head><body style='background:#0d0d0d;color:#fff;text-align:center;padding-top:100px;font-family:sans-serif;'><h3>Syncing Portal...</h3><p style='color:#666;'>${htmlEncode(msgText)}</p></body></html>"
+}
+
+// =============================================================================
+// Daily Checks and Child Device
+// =============================================================================
+
+def dailyMaintenanceCheck() {
+    def nowMs = now()
+    updateChildDevice()
+
+    if (appEnableSwitch && appEnableSwitch.currentValue("switch") == "off") return
+    if (notifyModes && !(notifyModes as List).contains(location.mode)) return
+
+    def threshold = safeInteger(upcomingDays, 7)
+    def allowOverdueReminders = remindOverdue != null ? remindOverdue : true
+    def alerts = []
+
+    getActiveTasksForDisplay().each { t ->
+        if (t.snoozed || t.muted) return
+        if (t.days == threshold) alerts << "UPCOMING: '${t.name}' is due in ${t.days} days."
+        else if (t.days == 0) alerts << "DUE TODAY: Time to complete '${t.name}'."
+        else if (t.days < 0 && allowOverdueReminders) alerts << "OVERDUE: '${t.name}' is overdue by ${Math.abs(t.days)} days."
+    }
+
+    if (alerts) {
+        def msg = "House Maintenance Alerts:\n" + alerts.join("\n")
+        logAction("Notifications fired: " + alerts.join(" | "))
+        if (notifyDevices) notifyDevices.deviceNotification(msg)
+    }
+}
+
+def updateChildDevice() {
+    def child = getChildDevice("AHM_${app.id}")
+    if (!child) return
+
+    def tasks = getActiveTasksForDisplay().sort { it.days }
+    def overdueTasks = tasks.findAll { it.days < 0 && !it.snoozed && !it.muted }
+    def maxOverdueDays = overdueTasks ? overdueTasks.collect { Math.abs(it.days) }.max() : 0
+
+    child.sendEvent(name: "overdueTasks", value: overdueTasks ? overdueTasks.collect { it.name }.join(", ") : "None", isStateChange: true)
+    child.sendEvent(name: "maxOverdueDays", value: maxOverdueDays, isStateChange: true)
+
+    def html = ""
+    if (tasks) {
+        html += "<table style='width:100%;border-collapse:collapse;font-size:14px;font-family:sans-serif;'>"
+        html += "<tr style='background-color:#343a40;color:white;'><th style='padding:6px;text-align:left;'>Top Tasks</th><th style='padding:6px;text-align:center;'>Due</th></tr>"
+        tasks.take(5).each { t ->
+            def color = "green"
+            if (t.muted) color = "#8e44ad"
+            else if (t.snoozed) color = "purple"
+            else if (t.days < 0) color = "red"
+            else if (t.days == 0) color = "darkorange"
+            else if (t.days <= safeInteger(upcomingDays, 7)) color = "orange"
+            html += "<tr><td style='padding:6px;border-bottom:1px solid #ccc;'>${htmlEncode(t.name)}</td><td style='padding:6px;border-bottom:1px solid #ccc;text-align:center;color:${color};font-weight:bold;'>${htmlEncode(dueLabel(t.days))}</td></tr>"
+        }
+        html += "</table>"
+    } else {
+        html = "<div style='padding:15px;text-align:center;font-family:sans-serif;font-size:16px;color:green;font-weight:bold;'>No active tasks</div>"
+    }
+
+    child.sendEvent(name: "htmlTile", value: html, isStateChange: true)
+}
+
+// =============================================================================
+// UI Helpers
+// =============================================================================
+
+def getStatusHtml() {
+    def tasks = getActiveTasksForDisplay()
+    def overdue = tasks.count { !it.muted && !it.snoozed && it.days < 0 }
+    def dueToday = tasks.count { !it.muted && !it.snoozed && it.days == 0 }
+    def upcoming = tasks.count { !it.muted && !it.snoozed && it.days > 0 && it.days <= safeInteger(upcomingDays, 7) }
+    def muted = tasks.count { it.muted }
+    def snoozed = tasks.count { it.snoozed }
+
+    def msg
+    if (appEnableSwitch && appEnableSwitch.currentValue("switch") == "off") msg = "<span style='color:red;'>Disabled via master switch. Notifications paused.</span>"
+    else if (overdue > 0) msg = "<span style='color:red;'><b>Requires attention:</b></span> ${overdue} task(s) overdue."
+    else if (dueToday > 0) msg = "<span style='color:darkorange;'><b>Due today:</b></span> ${dueToday} task(s) due today."
+    else if (upcoming > 0) msg = "<span style='color:orange;'><b>Upcoming:</b></span> ${upcoming} task(s) approaching due date."
+    else if (snoozed > 0 || muted > 0) msg = "<span style='color:purple;'><b>Deferred:</b></span> ${snoozed} snoozed / ${muted} muted task(s)."
+    else msg = "<span style='color:green;'><b>All good:</b></span> All active tasks are up to date."
+
+    return "<div style='background-color:#e9ecef;padding:10px;border-radius:5px;border-left:5px solid #007bff;margin-bottom:20px;'><b>System Status:</b> ${msg}</div>"
+}
+
+def getTaskPreviewHtml(String id) {
+    def task = getConfiguredTasks().find { it.id == id }
+    if (!task) return ""
+
+    def data = state.taskData ? state.taskData[id] : null
+    if (!data) data = [lastCompleted: 0L, snoozedUntil: 0L, completedOccurrences: []]
+    def due = calculateNextDueDateMs(task, data, now())
+    def days = daysUntil(due, now())
+
+    return "<div style='font-size:12px;color:#444;background-color:#f8f9fa;padding:8px;border-radius:4px;border-left:4px solid #17a2b8;margin-top:8px;'>" +
+        "<b>Preview:</b> ${htmlEncode(getScheduleLabel(task))}<br>" +
+        "<b>Next Due:</b> ${formatDateMs(due)} — ${htmlEncode(dueLabel(days))}" +
+        "</div>"
+}
+
+def statusTextHtml(Map t) {
+    if (t.muted) return "<span style='color:#8e44ad;font-weight:bold;'>MUTED</span>"
+    if (t.snoozed) return "<span style='color:purple;font-weight:bold;'>SNOOZED</span>"
+    if (t.days < 0) return "<span style='color:red;font-weight:bold;'>OVERDUE (${Math.abs(t.days)} days)</span>"
+    if (t.days == 0) return "<span style='color:darkorange;font-weight:bold;'>DUE TODAY</span>"
+    if (t.days <= safeInteger(upcomingDays, 7)) return "<span style='color:orange;font-weight:bold;'>Due soon (${t.days} days)</span>"
+    return "<span style='color:green;'>Good (${t.days} days left)</span>"
+}
+
+def dueLabel(Integer days) {
+    if (days < 0) return "Overdue by ${Math.abs(days)} days"
+    if (days == 0) return "Due today"
+    if (days == 1) return "Due tomorrow"
+    return "Due in ${days} days"
+}
+
+// =============================================================================
+// Date / Utility Helpers
+// =============================================================================
+
+def parseDateSettingToStartOfDayMs(def dateValue) {
+    if (!dateValue) return null
+    try {
+        if (dateValue instanceof Date) return startOfDayMs(dateValue.time)
+        String s = dateValue.toString()
+        return startOfDayMs(Date.parse("yyyy-MM-dd", s).time)
+    } catch (e) {
+        try {
+            return startOfDayMs(new Date(dateValue.toString()).time)
+        } catch (ignored) {
+            return null
+        }
+    }
+}
+
+def dateToMs(Integer year, Integer month, Integer day) {
+    Calendar cal = Calendar.getInstance(location.timeZone)
+    cal.clear()
+    cal.set(Calendar.YEAR, year)
+    cal.set(Calendar.MONTH, clamp(month, 1, 12) - 1)
+    cal.set(Calendar.DAY_OF_MONTH, 1)
+    int maxDay = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
+    cal.set(Calendar.DAY_OF_MONTH, clamp(day, 1, maxDay))
+    cal.set(Calendar.HOUR_OF_DAY, 0)
+    cal.set(Calendar.MINUTE, 0)
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    return cal.getTimeInMillis()
+}
+
+def startOfTodayMs(Long nowMs) {
+    return startOfDayMs(nowMs)
+}
+
+def startOfDayMs(Long ms) {
+    Calendar cal = Calendar.getInstance(location.timeZone)
+    cal.setTimeInMillis(ms)
+    cal.set(Calendar.HOUR_OF_DAY, 0)
+    cal.set(Calendar.MINUTE, 0)
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    return cal.getTimeInMillis()
+}
+
+def daysUntil(Long dueDateMs, Long nowMs) {
+    return Math.ceil((dueDateMs - nowMs) / 86400000.0).toInteger()
+}
+
+def formatDateMs(def ms) {
+    if (!ms || ms <= 0L) return "Never"
+    try {
+        return new Date(ms as Long).format("MM/dd/yyyy", location.timeZone)
+    } catch (e) {
+        return "Invalid date"
+    }
+}
+
+def monthName(def m) {
+    def idx = safeInteger(m, 1)
+    return monthOptions()[idx.toString()] ?: "Month ${idx}"
+}
+
+def clearExpiredMutes(Long nowMs) {
+    if (!state.muteExpirations) return
+    def removeKeys = []
+    state.muteExpirations.each { k, v -> if ((v as Long) < nowMs) removeKeys << k }
+    removeKeys.each { state.muteExpirations.remove(it) }
+}
+
+def isTaskMuted(String taskId, Long nowMs) {
+    return state.muteExpirations && state.muteExpirations[taskId] != null && (state.muteExpirations[taskId] as Long) > nowMs
+}
+
+def safeInteger(def value, Integer fallback) {
+    try {
+        if (value == null || value == "") return fallback
+        return value.toString().toInteger()
+    } catch (e) {
+        return fallback
+    }
+}
+
+def safeDecimal(def value, BigDecimal fallback) {
+    try {
+        if (value == null || value == "") return fallback
+        return new BigDecimal(value.toString())
+    } catch (e) {
+        return fallback
+    }
+}
+
+def clamp(Integer value, Integer min, Integer max) {
+    if (value < min) return min
+    if (value > max) return max
+    return value
+}
+
+def htmlEncode(def value) {
+    if (value == null) return ""
+    return value.toString()
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+}
+
+def logAction(String msg) {
+    if (txtEnable != false) log.info "${app.label}: ${msg}"
+    def h = state.actionHistory ?: []
+    h.add(0, "[${new Date().format('MM/dd HH:mm', location.timeZone)}] ${htmlEncode(msg)}")
+    if (h.size() > 30) h = h[0..29]
+    state.actionHistory = h
+}
+
+def logAction(Object msg) {
+    logAction(msg.toString())
+}
+
+def logInfo(def msg) {
+    if (txtEnable != false) log.info "${app.label}: ${msg}"
+}
